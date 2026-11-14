@@ -28,6 +28,16 @@ def prepare_image_base64(file_path: str) -> str:
         with open(file_path, "rb") as f:
             return base64.b64encode(f.read()).decode("utf-8")
 
+def mask_account_number(value) -> Optional[str]:
+    """Mask an account number so only the last 4 characters stay visible."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in ("null", "none"):
+        return None
+    visible = text[-4:] if len(text) > 4 else ""
+    return "****" + visible
+
 def extract_node(state: AgentState):
     file_path = state["file_path"]
     print(f"📄 Reading: {os.path.basename(file_path)}...")
@@ -54,6 +64,10 @@ def extract_node(state: AgentState):
         )
         response = llm.invoke([message])
         parsed_data = json.loads(response.content)
+        if not isinstance(parsed_data, dict):
+            raise ValueError("Model did not return a JSON object")
+        # Never keep the full bank account number in memory, logs or output files
+        parsed_data["account_number"] = mask_account_number(parsed_data.get("account_number"))
         return {"extracted_data": parsed_data}
     except Exception as e:
         return {"extracted_data": None, "validation_status": "FAILED", "remarks": f"Error: {str(e)}"}
@@ -111,6 +125,11 @@ if __name__ == "__main__":
             print(f"✅ Done: {os.path.basename(file_path)} -> {final_state['validation_status']} ({final_state['remarks']})\n")
             
         output_file_path = os.path.join(output_folder, "local_processed_payments.json")
-        with open(output_file_path, "w", encoding="utf-8") as f:
+        os.makedirs(output_folder, mode=0o700, exist_ok=True)
+        os.chmod(output_folder, 0o700)
+        # Owner-only permissions: results contain financial details
+        fd = os.open(output_file_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.chmod(output_file_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(all_results, f, indent=4, ensure_ascii=False)
         print(f"🎉 Saved all results to '{output_file_path}'!")

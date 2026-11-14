@@ -1,4 +1,4 @@
-langgraph
-langchain-ollama
-pydantic
-pymupdf
+langgraph==1.2.22
+langchain-ollama==1.1.0
+pydantic==2.14.3
+pymupdf==2.1
