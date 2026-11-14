@@ -11,14 +11,17 @@ For every file in `input_documents/`, the agent:
 1. Converts the first page to an image.
 2. Asks the local `llava` vision model to return the payment fields as JSON.
 3. Masks the bank account number so only the last 4 digits remain.
-4. Applies the approval rules and assigns a status.
-5. Writes all results to `output_results/local_processed_payments.json`.
+4. Checks the model's total against the amounts printed in the document's own text.
+5. Applies the approval rules and assigns a status.
+6. Writes all results to `output_results/local_processed_payments.json`.
 
 ```mermaid
 flowchart LR
     A[input_documents/] --> B[extractor<br/>llava via Ollama]
     B --> C[mask account number]
-    C --> D[validator<br/>approval rules]
+    A --> T[document text<br/>PyMuPDF]
+    C --> D[validator<br/>cross-check + approval rules]
+    T --> D
     D --> E[output_results/<br/>local_processed_payments.json]
 ```
 
@@ -45,8 +48,12 @@ Rules are checked in this order; the first match decides the status.
 | No data extracted | `REJECTED` |
 | Amount missing or not above zero | `NEEDS_REVIEW` |
 | Cheque without a signature | `REJECTED` |
-| Amount above 50,000 | `HUMAN_APPROVAL_REQUIRED` |
+| Document has no readable text (image or scanned PDF), so the amount cannot be verified | `NEEDS_REVIEW` |
+| Extracted amount is not printed in the document text | `NEEDS_REVIEW` |
+| Extracted amount, or the largest amount printed in the document, is above 50,000 | `HUMAN_APPROVAL_REQUIRED` |
 | Everything else | `APPROVED_FOR_PAYMENT` |
+
+A document is approved automatically only when the amount the model read is also printed in the document's text. The model alone can never approve a payment.
 
 ## Core tools
 
@@ -68,7 +75,9 @@ Rules are checked in this order; the first match decides the status.
 ├── output_results/             # Results are written here (ignored by git)
 ├── requirements.txt            # Pinned dependencies
 ├── docs/ARCHITECTURE.md        # How the code works
-└── SECURITY.md                 # Security policy and data handling
+├── SECURITY.md                 # Security policy and data handling
+├── CONTRIBUTING.md             # How to contribute
+└── LICENSE                     # MIT License
 ```
 
 ## Getting started
@@ -111,7 +120,7 @@ Supported input formats: `.pdf`, `.png`, `.jpg`, `.jpeg`. For PDFs, only the fir
 {
     "file_name": "demo_invoice_1.pdf",
     "status": "APPROVED_FOR_PAYMENT",
-    "remarks": "All details verified.",
+    "remarks": "Amount verified against document text.",
     "data": {
         "document_type": "Invoice",
         "document_number": "INV-2026-101",
@@ -131,6 +140,7 @@ This shows the intended result for the demo invoice. Actual values depend on wha
 
 - All processing is local; no document leaves your machine.
 - Account numbers are masked before they are stored or written anywhere.
+- Amounts are verified against the document text before anything is approved.
 - Result files are created with owner-only permissions.
 - Real documents and results are excluded from git by `.gitignore`.
 
@@ -140,11 +150,22 @@ See [SECURITY.md](SECURITY.md) for the full policy and how to report a vulnerabi
 
 This is a demonstration project, not a production payment system.
 
-- **The model can misread amounts.** In testing, `llava` read both demo invoices (11,800 and 94,400) as 1,000. A misread amount can put a document under the 50,000 limit and mark it `APPROVED_FOR_PAYMENT` when it should need human approval. Do not release payments on this status alone.
-- **The model can invent values.** It has returned an account number for invoices that contain none.
+- **The model can misread amounts.** In testing, `llava` read both demo invoices (11,800 and 94,400) as 1,000. The cross-check catches this and marks them `NEEDS_REVIEW`, so with `llava` the demos are not approved automatically. A more accurate vision model would improve this.
+- **Images and scanned PDFs always need review.** They have no text to verify the amount against.
+- **The cross-check only recognises amounts printed with two decimals** (for example `11,800.00`). Other formats go to review.
+- **The model can invent values.** An account number that does not appear in a PDF's text is discarded, but other fields are not verified, and on images nothing can be checked.
+- Do not release payments on this tool's status alone.
 - Only the first page of a PDF is read.
 - There is no automated test suite yet.
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Disclaimer
+
+This project is for learning and demonstration. It is provided as is, without warranty of any kind. It is not financial, accounting or legal advice, and its output must be checked by a person before any payment is made. You are responsible for how you use it and for the documents you process with it.
+
+## License
+
+Released under the [MIT License](LICENSE).

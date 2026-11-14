@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import glob
 import base64
@@ -11,6 +12,7 @@ from langgraph.graph import StateGraph, END
 class AgentState(TypedDict):
     file_path: str
     extracted_data: Optional[dict]
+    text_amounts: Optional[list]
     validation_status: str
     remarks: str
 
@@ -28,6 +30,28 @@ def prepare_image_base64(file_path: str) -> str:
         with open(file_path, "rb") as f:
             return base64.b64encode(f.read()).decode("utf-8")
 
+APPROVAL_LIMIT = 50000
+# Money amounts as printed in a document, e.g. 11,800.00 or 1,00,000.00
+AMOUNT_PATTERN = re.compile(r"(?<![\d.,])\d[\d,]*\.\d{2}(?!\d)")
+
+def read_document_text(file_path: str) -> str:
+    """Return the embedded text of a PDF (all pages). Images and scans return ''."""
+    if os.path.splitext(file_path)[1].lower() != ".pdf":
+        return ""
+    with pymupdf.open(file_path) as doc:
+        return "\n".join(page.get_text() for page in doc)
+
+def amounts_in_text(text: str) -> list:
+    """Find every money amount printed in the document text."""
+    return [float(m.replace(",", "")) for m in AMOUNT_PATTERN.findall(text)]
+
+def to_amount(value) -> Optional[float]:
+    """Convert a model-supplied amount to a float, or None if it is not a number."""
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+
 def mask_account_number(value) -> Optional[str]:
     """Mask an account number so only the last 4 characters stay visible."""
     if value is None:
@@ -43,6 +67,7 @@ def extract_node(state: AgentState):
     print(f"📄 Reading: {os.path.basename(file_path)}...")
     try:
         img_base64 = prepare_image_base64(file_path)
+        document_text = read_document_text(file_path)
         prompt = """
         Analyze this document image (Invoice or Cheque) and return ONLY a valid JSON object with these exact keys:
         {
@@ -66,9 +91,15 @@ def extract_node(state: AgentState):
         parsed_data = json.loads(response.content)
         if not isinstance(parsed_data, dict):
             raise ValueError("Model did not return a JSON object")
+        # Drop an account number the model invented: it must appear in the document text
+        account = parsed_data.get("account_number")
+        if document_text and account is not None:
+            account_digits = re.sub(r"\D", "", str(account))
+            if not account_digits or account_digits not in re.sub(r"\D", "", document_text):
+                account = None
         # Never keep the full bank account number in memory, logs or output files
-        parsed_data["account_number"] = mask_account_number(parsed_data.get("account_number"))
-        return {"extracted_data": parsed_data}
+        parsed_data["account_number"] = mask_account_number(account)
+        return {"extracted_data": parsed_data, "text_amounts": amounts_in_text(document_text)}
     except Exception as e:
         return {"extracted_data": None, "validation_status": "FAILED", "remarks": f"Error: {str(e)}"}
 
@@ -81,18 +112,29 @@ def validate_node(state: AgentState):
         return {"validation_status": "REJECTED", "remarks": "Failed to extract data."}
     
     doc_type = data.get("document_type")
-    amount = data.get("total_amount")
-    
-    if not amount or float(amount) <= 0:
+    amount = to_amount(data.get("total_amount"))
+
+    if amount is None or amount <= 0:
         return {"validation_status": "NEEDS_REVIEW", "remarks": "Amount not detected properly."}
-    
+
     if doc_type == "Cheque" and not data.get("is_signature_present"):
         return {"validation_status": "REJECTED", "remarks": "Signature missing on Cheque!"}
-    
-    if float(amount) > 50000:
-        return {"validation_status": "HUMAN_APPROVAL_REQUIRED", "remarks": f"Amount {amount} exceeds 50,000 limit."}
-    
-    return {"validation_status": "APPROVED_FOR_PAYMENT", "remarks": "All details verified."}
+
+    # The model can misread amounts, so its total is only trusted when the same
+    # figure is printed in the document's own text.
+    text_amounts = state.get("text_amounts") or []
+    if not text_amounts:
+        return {"validation_status": "NEEDS_REVIEW", "remarks": "Amount could not be verified against the document text (image or scanned file). Manual check required."}
+
+    if not any(abs(amount - printed) < 0.005 for printed in text_amounts):
+        return {"validation_status": "NEEDS_REVIEW", "remarks": f"Extracted amount {amount} does not appear in the document text. Manual check required."}
+
+    # Use the largest printed figure too, in case the model picked a subtotal
+    highest = max(amount, max(text_amounts))
+    if highest > APPROVAL_LIMIT:
+        return {"validation_status": "HUMAN_APPROVAL_REQUIRED", "remarks": f"Amount {highest} exceeds {APPROVAL_LIMIT:,} limit."}
+
+    return {"validation_status": "APPROVED_FOR_PAYMENT", "remarks": "Amount verified against document text."}
 
 workflow = StateGraph(AgentState)
 workflow.add_node("extractor", extract_node)
@@ -114,7 +156,7 @@ if __name__ == "__main__":
     else:
         all_results = []
         for file_path in files:
-            initial_state = {"file_path": file_path, "extracted_data": None, "validation_status": "", "remarks": ""}
+            initial_state = {"file_path": file_path, "extracted_data": None, "text_amounts": None, "validation_status": "", "remarks": ""}
             final_state = agent_app.invoke(initial_state)
             all_results.append({
                 "file_name": os.path.basename(file_path),
