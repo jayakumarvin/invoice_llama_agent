@@ -14,7 +14,7 @@ class AgentState(TypedDict):
     validation_status: str
     remarks: str
 
-# JSON format-ஐ நேரடியாகக் கட்டாயப்படுத்தும் Ollama அமைப்பு
+# JSON format-controling ollama system
 llm = ChatOllama(model="llava", temperature=0, format="json")
 
 def prepare_image_base64(file_path: str) -> str:
